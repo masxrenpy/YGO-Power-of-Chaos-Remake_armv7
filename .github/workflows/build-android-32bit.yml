@@ -1,0 +1,99 @@
+name: Android 32 bits
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: android32-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.tool_cache }}/poc-godot-4.7.2
+          key: godot-windows-4.7.2-verified-v2
+
+      # Activa armeabi-v7a (32 bits) y desactiva arm64-v8a en el preset de exportacion.
+      # Si alguna linea no existe, el paso falla en vez de compilar un APK equivocado.
+      - name: Activar arquitectura de 32 bits
+        shell: pwsh
+        run: |
+          $path = "game/export_presets.cfg"
+          $text = [IO.File]::ReadAllText($path)
+          $changes = @(
+            @('architectures/armeabi-v7a=false', 'architectures/armeabi-v7a=true'),
+            @('architectures/arm64-v8a=true', 'architectures/arm64-v8a=false')
+          )
+          foreach ($change in $changes) {
+            if (-not $text.Contains($change[0])) { throw "No se encontro en el preset: $($change[0])" }
+            $text = $text.Replace($change[0], $change[1])
+          }
+          [IO.File]::WriteAllText($path, $text)
+          Select-String -Path $path -Pattern 'architectures/'
+
+      # Sin secretos: se firma con una clave desechable (valida para instalar a mano).
+      - name: Compilar APK Android
+        shell: pwsh
+        run: |
+          python tools/build_android.py --engine-cache "${{ runner.tool_cache }}/poc-godot-4.7.2" --out "$env:RUNNER_TEMP/android"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Comprobar que el APK solo contiene 32 bits
+        shell: python
+        run: |
+          import os, sys, zipfile
+          apk = os.path.join(os.environ["RUNNER_TEMP"], "android", "PowerOfChaos-Android.apk")
+          names = zipfile.ZipFile(apk).namelist()
+          abis = sorted({n.split("/")[1] for n in names if n.startswith("lib/") and n.count("/") >= 2})
+          print("Arquitecturas dentro del APK:", abis)
+          sys.exit(0 if abis == ["armeabi-v7a"] else 1)
+
+      - name: Preparar archivos de salida
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item "$env:RUNNER_TEMP/android/PowerOfChaos-Android.apk" "out/PowerOfChaos-Android-32bit.apk"
+          $hash = (Get-FileHash "out/PowerOfChaos-Android-32bit.apk" -Algorithm SHA256).Hash.ToLower()
+          "$hash  PowerOfChaos-Android-32bit.apk" | Set-Content -Encoding ascii "out/PowerOfChaos-Android-32bit.apk.sha256"
+
+      - name: Guardar APK como artefacto
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: PowerOfChaos-Android-32bit
+          path: out/*
+          if-no-files-found: error
+          retention-days: 30
+
+      # Publica el APK como "Release" para descargarlo directo desde el celular, sin ZIP.
+      - name: Publicar en Releases
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $tag = "android32-build${{ github.run_number }}"
+          gh release create $tag "out/PowerOfChaos-Android-32bit.apk" "out/PowerOfChaos-Android-32bit.apk.sha256" `
+            --target "${{ github.sha }}" --prerelease `
+            --title "Android 32 bits (build ${{ github.run_number }})" `
+            --notes "APK sin recursos del juego, solo ARM de 32 bits (armeabi-v7a). Requiere tu archivo .pck."
+
+      - name: Guardar registros de compilacion
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android-build-logs
+          path: |
+            ${{ runner.temp }}/android/work/build/*.log
+            ${{ runner.temp }}/android/work/build/*.json
+          if-no-files-found: ignore
+          retention-days: 14
