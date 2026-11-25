@@ -41,6 +41,28 @@ jobs:
           [IO.File]::WriteAllText($path, $text)
           Select-String -Path $path -Pattern 'architectures/'
 
+      # Hace que el modo "Menu" funcione en los duelos: al tocar una carta con varias acciones
+      # muestra el panel (Invocar, Atacar, Activar...) en vez de exigir un toque largo.
+      # El modo "Mantener" no cambia. Si el codigo original cambia, el paso falla sin compilar.
+      - name: Mejorar controles tactiles (modo Menu)
+        shell: pwsh
+        run: |
+          $path = "game/core/mobile_pointer.gd"
+          $text = [IO.File]::ReadAllText($path)
+          $nl = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
+          $t = "`t"
+          $anchor = "func _finish_card_tap(point: Vector2) -> void:" + $nl
+          if (([regex]::Matches($text, [regex]::Escape($anchor))).Count -ne 1) { throw "No se encontro _finish_card_tap" }
+          $lines = @(
+            ($t + 'if _touch_card.begins_with("duel:") and _right_available and not _actions.is_empty() and _mode() == "menu":'),
+            ($t + $t + '_selected_card = ""'),
+            ($t + $t + '_show_at(point)'),
+            ($t + $t + 'return')
+          )
+          $text = $text.Replace($anchor, $anchor + ($lines -join $nl) + $nl)
+          [IO.File]::WriteAllText($path, $text)
+          Select-String -Path $path -Pattern '_mode\(\) == "menu"'
+
       # Sin secretos: se firma con una clave desechable (valida para instalar a mano).
       - name: Compilar APK Android
         shell: pwsh
