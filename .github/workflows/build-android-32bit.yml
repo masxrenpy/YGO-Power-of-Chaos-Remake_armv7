@@ -2,6 +2,11 @@ name: Android 32 bits
 
 on:
   workflow_dispatch:
+    inputs:
+      prerelease:
+        description: "Marcar como pre-lanzamiento (dejar activado mientras pruebas)"
+        type: boolean
+        default: true
 
 concurrency:
   group: android32-${{ github.ref }}
@@ -26,48 +31,98 @@ jobs:
       # Activa armeabi-v7a (32 bits) y desactiva arm64-v8a en el preset de exportacion.
       # Si alguna linea no existe, el paso falla en vez de compilar un APK equivocado.
       - name: Activar arquitectura de 32 bits
-        shell: pwsh
+        shell: python
         run: |
-          $path = "game/export_presets.cfg"
-          $text = [IO.File]::ReadAllText($path)
-          $changes = @(
-            @('architectures/armeabi-v7a=false', 'architectures/armeabi-v7a=true'),
-            @('architectures/arm64-v8a=true', 'architectures/arm64-v8a=false')
-          )
-          foreach ($change in $changes) {
-            if (-not $text.Contains($change[0])) { throw "No se encontro en el preset: $($change[0])" }
-            $text = $text.Replace($change[0], $change[1])
-          }
-          [IO.File]::WriteAllText($path, $text)
-          Select-String -Path $path -Pattern 'architectures/'
+          import pathlib, sys
+          path = pathlib.Path("game/export_presets.cfg")
+          text = path.read_text(encoding="utf-8")
+          for old, new in (("architectures/armeabi-v7a=false", "architectures/armeabi-v7a=true"),
+                           ("architectures/arm64-v8a=true", "architectures/arm64-v8a=false")):
+              if text.count(old) != 1:
+                  sys.exit("No se encontro en el preset: " + old)
+              text = text.replace(old, new)
+          path.write_text(text, encoding="utf-8", newline="\n")
+          print([l for l in text.splitlines() if l.startswith("architectures/")])
 
-      # Hace que el modo "Menu" funcione en los duelos: al tocar una carta con varias acciones
-      # muestra el panel (Invocar, Atacar, Activar...) en vez de exigir un toque largo.
-      # El modo "Mantener" no cambia. Si el codigo original cambia, el paso falla sin compilar.
+      # Controles tactiles: el panel de acciones (Invocar, Atacar, Activar...) aparece al tocar
+      # una carta, tambien cuando solo tiene una accion. Solo afecta al modo "Menu".
+      # Si el codigo original cambia, el paso falla sin compilar un APK a medias.
       - name: Mejorar controles tactiles (modo Menu)
-        shell: pwsh
+        shell: python
         run: |
-          $path = "game/core/mobile_pointer.gd"
-          $text = [IO.File]::ReadAllText($path)
-          $nl = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
-          $t = "`t"
-          $anchor = "func _finish_card_tap(point: Vector2) -> void:" + $nl
-          if (([regex]::Matches($text, [regex]::Escape($anchor))).Count -ne 1) { throw "No se encontro _finish_card_tap" }
-          $lines = @(
-            ($t + 'if _touch_card.begins_with("duel:") and _right_available and not _actions.is_empty() and _mode() == "menu":'),
-            ($t + $t + '_selected_card = ""'),
-            ($t + $t + '_show_at(point)'),
-            ($t + $t + 'return')
-          )
-          $text = $text.Replace($anchor, $anchor + ($lines -join $nl) + $nl)
-          [IO.File]::WriteAllText($path, $text)
-          Select-String -Path $path -Pattern '_mode\(\) == "menu"'
+          import pathlib, sys
+          path = pathlib.Path("game/core/mobile_pointer.gd")
+          text = path.read_text(encoding="utf-8")
+          T = "\t"
+          edits = [
+              ("func _finish_card_tap(point: Vector2) -> void:\n",
+               "func _finish_card_tap(point: Vector2) -> void:\n"
+               + T + 'if _touch_card.begins_with("duel:") and _right_available and not _actions.is_empty() and _mode() == "menu":\n'
+               + T * 2 + '_selected_card = ""\n'
+               + T * 2 + "_show_at(point)\n"
+               + T * 2 + "return\n"),
+              ("var count := maxi(2, _actions.size())",
+               "var count := _actions.size() if not _actions.is_empty() else 2"),
+              ("_right_available = _has_right_action(point) and mask != 0 and (mask & (mask - 1)) != 0",
+               '_right_available = _has_right_action(point) and mask != 0 and ((mask & (mask - 1)) != 0 or _mode() == "menu")'),
+          ]
+          for old, new in edits:
+              if text.count(old) != 1:
+                  sys.exit("No se encontro (o esta repetido) en mobile_pointer.gd: " + old[:70])
+              text = text.replace(old, new)
+          path.write_text(text, encoding="utf-8", newline="\n")
+          print("mobile_pointer.gd actualizado")
 
-      # Sin secretos: se firma con una clave desechable (valida para instalar a mano).
+      # Firma fija: usa TU clave (secreto ANDROID_KEYSTORE_B64) para que cada APK nuevo
+      # se instale encima del anterior sin perder partidas. El script del proyecto solo acepta
+      # la clave de su autor, asi que aqui se cambia esa huella por la de tu clave.
+      - name: Preparar clave de firma fija
+        shell: python
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: |
+          import base64, hashlib, os, pathlib, re, subprocess, sys
+          b64 = "".join(os.environ.get("KS_B64", "").split())
+          if not b64:
+              sys.exit("FALTA el secreto ANDROID_KEYSTORE_B64. Crealo en Settings > Secrets and variables > Actions (ver la guia).")
+          keystore = pathlib.Path(os.environ["RUNNER_TEMP"]) / "release.keystore"
+          try:
+              keystore.write_bytes(base64.b64decode(b64, validate=True))
+          except Exception:
+              sys.exit("El secreto ANDROID_KEYSTORE_B64 no es base64 valido: pegalo completo, sin comillas ni espacios extra.")
+          keytool = None
+          for name in ("JAVA_HOME_21_X64", "JAVA_HOME_17_X64", "JAVA_HOME"):
+              for exe in ("keytool.exe", "keytool"):
+                  candidate = pathlib.Path(os.environ.get(name, "")) / "bin" / exe
+                  if os.environ.get(name) and candidate.is_file():
+                      keytool = str(candidate)
+                      break
+              if keytool:
+                  break
+          if not keytool:
+              sys.exit("No se encontro keytool (JDK) en el servidor")
+          result = subprocess.run([keytool, "-exportcert", "-keystore", str(keystore),
+                                   "-storepass", "android", "-alias", "androiddebugkey"],
+                                  capture_output=True)
+          if result.returncode != 0:
+              sys.exit("No se pudo leer la clave (alias androiddebugkey, contrasena android): "
+                       + result.stderr.decode(errors="replace"))
+          digest = hashlib.sha256(result.stdout).hexdigest()
+          script = pathlib.Path("tools/android/build_apk.py")
+          text = script.read_text(encoding="utf-8")
+          text, count = re.subn(r'^PUBLIC_SIGNING_CERTIFICATE = "[0-9a-f]{64}"$',
+                                'PUBLIC_SIGNING_CERTIFICATE = "' + digest + '"', text, flags=re.M)
+          if count != 1:
+              sys.exit("No se encontro PUBLIC_SIGNING_CERTIFICATE en build_apk.py")
+          script.write_text(text, encoding="utf-8", newline="\n")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write("KEYSTORE_PATH=" + str(keystore) + "\n")
+          print("Huella SHA-256 de tu certificado de firma:", digest)
+
       - name: Compilar APK Android
         shell: pwsh
         run: |
-          python tools/build_android.py --engine-cache "${{ runner.tool_cache }}/poc-godot-4.7.2" --out "$env:RUNNER_TEMP/android"
+          python tools/build_android.py --engine-cache "${{ runner.tool_cache }}/poc-godot-4.7.2" --out "$env:RUNNER_TEMP/android" --keystore "$env:KEYSTORE_PATH"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Comprobar que el APK solo contiene 32 bits
@@ -88,6 +143,37 @@ jobs:
           $hash = (Get-FileHash "out/PowerOfChaos-Android-32bit.apk" -Algorithm SHA256).Hash.ToLower()
           "$hash  PowerOfChaos-Android-32bit.apk" | Set-Content -Encoding ascii "out/PowerOfChaos-Android-32bit.apk.sha256"
 
+      - name: Redactar notas de la release
+        shell: python
+        run: |
+          import hashlib, pathlib
+          digest = hashlib.sha256(pathlib.Path("out/PowerOfChaos-Android-32bit.apk").read_bytes()).hexdigest()
+          notes = """## Power of Chaos Remake - Android 32 bits (no oficial)
+
+          APK para dispositivos **ARM de 32 bits** (armeabi-v7a), basado en
+          [Yu-Gi-Oh-Power-of-Chaos-Remake](https://github.com/Johanfer12/Yu-Gi-Oh-Power-of-Chaos-Remake) de Johanfer12.
+          Proyecto independiente, sin relacion con los titulares de los juegos originales ni con el autor.
+
+          **No incluye ningun recurso del juego.** Necesitas tu propio archivo `.pck`, que se elige al abrir la app por primera vez.
+
+          ### Cambios respecto al APK original
+          - Compilado solo para 32 bits (el original es de 64 bits).
+          - Controles tactiles: en modo *Menu* el panel de acciones aparece al tocar una carta.
+
+          ### Instalacion
+          1. Descarga `PowerOfChaos-Android-32bit.apk` y abrelo (Android pedira permitir instalar apps desconocidas).
+          2. Abre la app y elige tu `.pck`.
+          3. Las versiones nuevas de esta serie se instalan **encima** de la anterior y conservan tus datos (misma firma).
+
+          ### Avisos
+          - No uses el boton de actualizar dentro de la app: busca versiones del autor original, que son de 64 bits.
+          - No se puede instalar junto al APK oficial: usan el mismo identificador de app y distinta firma.
+          - Rendimiento limitado en moviles modestos. Probado en un Redmi 9A (Android 10).
+
+          SHA-256 del APK: `""" + digest + """`
+          """
+          pathlib.Path("out/notes.md").write_text(notes, encoding="utf-8", newline="\n")
+
       - name: Guardar APK como artefacto
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -104,10 +190,12 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           $tag = "android32-build${{ github.run_number }}"
+          $flags = @()
+          if ("${{ inputs.prerelease }}" -eq "true") { $flags += "--prerelease" } else { $flags += "--latest" }
           gh release create $tag "out/PowerOfChaos-Android-32bit.apk" "out/PowerOfChaos-Android-32bit.apk.sha256" `
-            --target "${{ github.sha }}" --prerelease `
+            --target "${{ github.sha }}" @flags `
             --title "Android 32 bits (build ${{ github.run_number }})" `
-            --notes "APK sin recursos del juego, solo ARM de 32 bits (armeabi-v7a). Requiere tu archivo .pck."
+            --notes-file "out/notes.md"
 
       - name: Guardar registros de compilacion
         if: always()
