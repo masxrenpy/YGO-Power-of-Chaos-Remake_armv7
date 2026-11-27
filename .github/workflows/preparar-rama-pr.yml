@@ -1,0 +1,268 @@
+name: Preparar rama del PR
+
+# Se ejecuta una sola vez a mano. Crea en TU fork la rama "armv7-touch-menu" a partir del
+# main actual del autor, con los cambios del PR. No modifica tu main.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  branch:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_URL: https://github.com/Johanfer12/Yu-Gi-Oh-Power-of-Chaos-Remake.git
+      BRANCH: armv7-touch-menu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Crear la rama desde el main actual del autor
+        run: |
+          git fetch --no-tags "$UPSTREAM_URL" main
+          UP=$(git rev-parse FETCH_HEAD)
+          if ! git merge-base --is-ancestor "$UP" HEAD; then
+            echo "::error::Tu fork no esta sincronizado con el main actual del autor ($UP). Usa Sync fork > Discard commits y vuelve a ejecutar este workflow."
+            exit 1
+          fi
+          git checkout -q -B "$BRANCH" "$UP"
+          git log --oneline -1
+
+      - name: Aplicar los cambios del PR
+        shell: python
+        run: |
+          import pathlib, sys
+
+          ROOT = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".")
+
+
+          def edit(rel, pairs):
+              path = ROOT / rel
+              text = path.read_text(encoding="utf-8")
+              for old, new in pairs:
+                  if text.count(old) != 1:
+                      sys.exit("No se encontro (o esta repetido) en " + rel + ": " + old[:70])
+                  text = text.replace(old, new)
+              path.write_text(text, encoding="utf-8", newline="\n")
+              print("editado", rel)
+
+
+          T = "\t"
+
+          # 1) Menu tactil en duelos: el arreglo va directamente en el codigo fuente.
+          edit("game/core/mobile_pointer.gd", [
+              ("func _finish_card_tap(point: Vector2) -> void:\n",
+               "func _finish_card_tap(point: Vector2) -> void:\n"
+               + T + 'if _touch_card.begins_with("duel:") and _right_available and not _actions.is_empty() and _mode() == "menu":\n'
+               + T * 2 + '_selected_card = ""\n'
+               + T * 2 + "_show_at(point)\n"
+               + T * 2 + "return\n"),
+              ("var count := maxi(2, _actions.size())",
+               "var count := _actions.size() if not _actions.is_empty() else 2"),
+              ("_right_available = can_act and mask != 0 and (mask & (mask - 1)) != 0",
+               '_right_available = can_act and mask != 0 and ((mask & (mask - 1)) != 0 or _mode() == "menu")'),
+              # Con un unico atacante legal se conserva el ataque directo de un toque (sin panel).
+              (T * 2 + '_touch_card = ""\n' + T * 2 + '_selected_card = ""\n' + T + "if _right_available:\n",
+               T * 2 + '_touch_card = ""\n' + T * 2 + '_selected_card = ""\n'
+               + T * 2 + "_right_available = false  # el menu no se abre: se mantiene el toque directo\n"
+               + T + "if _right_available:\n"),
+          ])
+
+          # 2) build_apk.py: opcion --abi armv7; el preset del repositorio (arm64) no se toca.
+          edit("tools/android/build_apk.py", [
+              ("def android_version_code(root=ROOT):",
+               r'''def use_armv7(presets: Path) -> None:
+              """Export 32-bit ARM instead of 64-bit ARM in a staged copy; the repository preset stays arm64."""
+              text = presets.read_text(encoding="utf8")
+              for old, new in (("architectures/armeabi-v7a=false", "architectures/armeabi-v7a=true"),
+                               ("architectures/arm64-v8a=true", "architectures/arm64-v8a=false")):
+                  if text.count(old) != 1:
+                      raise RuntimeError(f"Cannot switch the export to ARMv7, preset line not found once: {old}")
+                  text = text.replace(old, new)
+              presets.write_text(text, encoding="utf8", newline="\n")
+
+
+          def android_version_code(root=ROOT):'''),
+              ('    parser.add_argument("--engine-only", action="store_true", help="public APK without original game content")\n',
+               '    parser.add_argument("--engine-only", action="store_true", help="public APK without original game content")\n'
+               '    parser.add_argument("--abi", choices=("arm64", "armv7"), default="arm64",\n'
+               '                        help="CPU architecture to export: arm64 (default, official) or armv7 (32-bit ARM devices)")\n'),
+              ('        ".godot", "tests", "temp", "artifacts", "unused", "*.uid", "share_smoke.gd"))\n',
+               '        ".godot", "tests", "temp", "artifacts", "unused", "*.uid", "share_smoke.gd"))\n'
+               '    if args.abi == "armv7":\n'
+               '        use_armv7(STAGE / "export_presets.cfg")\n'),
+              ("        metadata = dict(package='org.porttesting.powerofchaos', apk='PowerOfChaos-Android.apk', version=TAG,",
+               "        metadata = dict(package='org.porttesting.powerofchaos', apk='PowerOfChaos-Android.apk' if args.abi == 'arm64' else 'PowerOfChaos-Android-ARMv7.apk', version=TAG,"),
+              ("        (OUT / 'ANDROID_RELEASE.json').write_text(json.dumps(metadata, indent=2), encoding='utf8')\n",
+               "        if args.abi != 'arm64':\n            metadata['abi'] = args.abi\n"
+               "        (OUT / 'ANDROID_RELEASE.json').write_text(json.dumps(metadata, indent=2), encoding='utf8')\n"),
+          ])
+
+          # 3) build_android.py: se pasa la opcion a build_apk.py.
+          edit("tools/build_android.py", [
+              ("def build(cache: Path, out: Path, keystore: Path | None) -> dict:",
+               'def build(cache: Path, out: Path, keystore: Path | None, abi: str = "arm64") -> dict:'),
+              ('    apk = out / "PowerOfChaos-Android.apk"\n',
+               '    apk = out / ("PowerOfChaos-Android.apk" if abi == "arm64" else "PowerOfChaos-Android-ARMv7.apk")\n'),
+              ('"--release" if release else "--first-build", "--godot", str(godot),',
+               '"--release" if release else "--first-build", "--abi", abi, "--godot", str(godot),'),
+              ('    args = parser.parse_args()\n    build(args.engine_cache, args.out, args.keystore)',
+               '    parser.add_argument("--abi", choices=("arm64", "armv7"), default="arm64",\n'
+               '                        help="arm64 (official) or armv7 (32-bit ARM devices)")\n'
+               '    args = parser.parse_args()\n    build(args.engine_cache, args.out, args.keystore, args.abi)'),
+          ])
+
+          # 4) Documentacion (EN/ES).
+          edit("tools/public_android/README.md", [
+              ("To prepare only a private resource pack, Godot is sufficient:",
+               "For devices with a 32-bit ARM processor (armeabi-v7a), add `--abi armv7` to the same command. Only the staged export copy changes: the repository's export preset and the official public APK stay 64-bit (arm64-v8a). The in-app updater only knows the public 64-bit APK, so update 32-bit builds manually with the same signing key.\n\nTo prepare only a private resource pack, Godot is sufficient:"),
+          ])
+          edit("tools/public_android/README.es.md", [
+              ("Para preparar sólo el paquete privado de recursos basta con Godot:",
+               "Para dispositivos con procesador ARM de 32 bits (armeabi-v7a), añade `--abi armv7` al mismo comando. Sólo cambia la copia de exportación temporal: el preset del repositorio y el APK público oficial siguen siendo de 64 bits (arm64-v8a). El actualizador de la app sólo conoce el APK público de 64 bits, así que actualiza las compilaciones de 32 bits manualmente con la misma clave de firma.\n\nPara preparar sólo el paquete privado de recursos basta con Godot:"),
+          ])
+
+          # 5) Pruebas.
+          TESTS = r'''
+
+          class AndroidArchitectureTests(unittest.TestCase):
+              """--abi armv7 solo cambia la copia de exportacion; el preset oficial sigue siendo arm64."""
+              ROOT = Path(__file__).resolve().parents[2]
+
+              def _build_apk(self):
+                  spec = importlib.util.spec_from_file_location("build_apk_under_test", self.ROOT / "tools/android/build_apk.py")
+                  module = importlib.util.module_from_spec(spec)
+                  spec.loader.exec_module(module)
+                  return module
+
+              def test_official_preset_stays_arm64_only(self):
+                  text = (self.ROOT / "game/export_presets.cfg").read_text(encoding="utf8")
+                  for line in ("architectures/arm64-v8a=true", "architectures/armeabi-v7a=false",
+                               "architectures/x86=false", "architectures/x86_64=false"):
+                      self.assertEqual(text.count(line), 1, line)
+
+              def test_armv7_switch_changes_only_the_two_architecture_lines(self):
+                  original = (self.ROOT / "game/export_presets.cfg").read_text(encoding="utf8")
+                  with tempfile.TemporaryDirectory() as temporary:
+                      presets = Path(temporary) / "export_presets.cfg"
+                      presets.write_text(original, encoding="utf8", newline="\n")
+                      self._build_apk().use_armv7(presets)
+                      changed = presets.read_text(encoding="utf8")
+                  before, after = original.splitlines(), changed.splitlines()
+                  self.assertEqual(len(before), len(after))
+                  self.assertEqual(sorted(f"{old} -> {new}" for old, new in zip(before, after) if old != new),
+                                   ["architectures/arm64-v8a=true -> architectures/arm64-v8a=false",
+                                    "architectures/armeabi-v7a=false -> architectures/armeabi-v7a=true"])
+
+              def test_armv7_switch_refuses_an_unexpected_preset(self):
+                  with tempfile.TemporaryDirectory() as temporary:
+                      presets = Path(temporary) / "export_presets.cfg"
+                      presets.write_text("architectures/armeabi-v7a=false\narchitectures/arm64-v8a=false\n", encoding="utf8")
+                      with self.assertRaisesRegex(RuntimeError, "ARMv7"):
+                          self._build_apk().use_armv7(presets)
+          '''
+          edit("tools/tests/test_android_builder.py", [
+              ('\n\nif __name__ == "__main__":\n    unittest.main()',
+               TESTS + '\n\nif __name__ == "__main__":\n    unittest.main()'),
+              ("import hashlib\nimport os\n", "import hashlib\nimport importlib.util\nimport os\n"),
+          ])
+          print("Listo: 6 archivos actualizados")
+
+      - name: Subir la rama a tu fork
+        run: |
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
+          git add -A
+          git status --short
+          git commit -q -m "Touch menu in duels and opt-in ARMv7 Android export" \
+            -m "Menu touch mode now opens the action panel for the player's cards in duels, also for cards with a single action. Adds an opt-in --abi armv7 option to the Android build tools; the repository export preset and the official build stay arm64-only." \
+            -m "Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+          Claude-Session: https://claude.ai/code/session_01Mnu9hBFcfHAVty6EJwkDD8"
+          git push --force origin "$BRANCH"
+          LINK="https://github.com/Johanfer12/Yu-Gi-Oh-Power-of-Chaos-Remake/compare/main...${{ github.repository_owner }}:${{ github.event.repository.name }}:$BRANCH?expand=1"
+          echo "### Rama subida: $BRANCH" >> "$GITHUB_STEP_SUMMARY"
+          echo "[Abrir el Pull Request]($LINK)" >> "$GITHUB_STEP_SUMMARY"
+          echo "$LINK"￼EnterPreparar rama del PR
+
+# Se ejecuta una sola vez a mano. Crea en TU fork la rama "armv7-touch-menu" a partir del
+# main actual del autor, con los cambios del PR. No modifica tu main.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  branch:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_URL: https://github.com/Johanfer12/Yu-Gi-Oh-Power-of-Chaos-Remake.git
+      BRANCH: armv7-touch-menu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Crear la rama desde el main actual del autor
+        run: |
+          git fetch --no-tags "$UPSTREAM_URL" main
+          UP=$(git rev-parse FETCH_HEAD)
+          if ! git merge-base --is-ancestor "$UP" HEAD; then
+            echo "::error::Tu fork no esta sincronizado con el main actual del autor ($UP). Usa Sync fork > Discard commits y vuelve a ejecutar este workflow."
+            exit 1
+          fi
+          git checkout -q -B "$BRANCH" "$UP"
+          git log --oneline -1
+
+      - name: Aplicar los cambios del PR
+        shell: python
+        run: |
+          import pathlib, sys
+
+          ROOT = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".")
+
+
+          def edit(rel, pairs):
+              path = ROOT / rel
+              text = path.read_text(encoding="utf-8")
+              for old, new in pairs:
+                  if text.count(old) != 1:
+                      sys.exit("No se encontro (o esta repetido) en " + rel + ": " + old[:70])
+                  text = text.replace(old, new)
+              path.write_text(text, encoding="utf-8", newline="\n")
+              print("editado", rel)
+
+
+          T = "\t"
+
+          # 1) Menu tactil en duelos: el arreglo va directamente en el codigo fuente.
+          edit("game/core/mobile_pointer.gd", [
+              ("func _finish_card_tap(point: Vector2) -> void:\n",
+               "func _finish_card_tap(point: Vector2) -> void:\n"
+               + T + 'if _touch_card.begins_with("duel:") and _right_available and not _actions.is_empty() and _mode() == "menu":\n'
+               + T * 2 + '_selected_card = ""\n'
+               + T * 2 + "_show_at(point)\n"
+               + T * 2 + "return\n"),
+              ("var count := maxi(2, _actions.size())",
+               "var count := _actions.size() if not _actions.is_empty() else 2"),
+              ("_right_available = can_act and mask != 0 and (mask & (mask - 1)) != 0",
+               '_right_available = can_act and mask != 0 and ((mask & (mask - 1)) != 0 or _mode() == "menu")'),
+              # Con un unico atacante legal se conserva el ataque directo de un toque (sin panel).
+              (T * 2 + '_touch_card = ""\n' + T * 2 + '_selected_card = ""\n' + T + "if _right_available:\n",
+               T * 2 + '_touch_card = ""\n' + T * 2 + '_selected_card = ""\n'
+               + T * 2 + "_right_available = false  # el menu no se abre: se mantiene el toque directo\n"
+               + T + "if _right_available:\n"),
+          ])
+
+          # 2) build_apk.py: opcion --abi armv7; el preset del repositorio (arm64) no se toca.
+          edit("tools/android/build_apk.py", [
+              ("def android_version_code(root=ROOT):",
+               r'''def use_armv7(presets: Path) -> None:
+              """Export 32-bit ARM instead of 64-bit ARM in a staged copy; the repository preset stays arm64."""
+              text = presets.read_text(encoding="utf8")
+              for old, new in (("architectures/armeabi-v7a=false", "architectures/armeabi-v7a=true"),
+                               ("architectures/arm64-v8a=true", "architectures/arm64-v8a=false")):
+                  if text.count(old) != 1:
+                      raise RuntimeError(f"Cannot switch the export to ARMv7, preset line not found once: {old}")
